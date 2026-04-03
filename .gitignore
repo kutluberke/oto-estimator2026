@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env
+
+# Veri & model dosyaları (scraping sonuçları — her çalıştırmada yeniden üretilir)
+data/*.csv
+data/*.json
+models/*.pkl
+models/*.joblib
+models/*.json
+plots/*.png
+plots/*.jpg
+
+# Loglar
+logs/*.txt
+logs/*.log
+
+# Streamlit
+.streamlit/secrets.toml
+
+# IDE
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Debug dosyaları
+debug_scraper.py
+debug_scraper2.py
