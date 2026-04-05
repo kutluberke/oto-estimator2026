@@ -253,53 +253,52 @@ def _scrape_detail(url: str) -> dict:
 def _parse_row(row, marka: str, model_query: str) -> Optional[dict]:
     try:
         tds = row.find_all("td")
-        if len(tds) < 7:
+        if len(tds) < 6:
             return None
 
         model_full = tds[1].get_text(strip=True)
-        title      = tds[2].get_text(strip=True)
-        year       = _parse_year(tds[3].get_text(strip=True))
-        km         = _parse_km(tds[4].get_text(strip=True))
+
+        # Başlık artık td[1] içindeki div'de
+        title_div = tds[1].find("div", class_="listing-title-lines")
+        title = title_div.get_text(strip=True) if title_div else model_full
+
+        year = _parse_year(tds[2].get_text(strip=True))  # eskisi: tds[3]
+        km = _parse_km(tds[3].get_text(strip=True))  # eskisi: tds[4]
 
         if km is None:
             return None
 
-        # Fiyat: span.listing-price veya td[6] text
-        price_td   = tds[6]
+        price_td = tds[5]  # eskisi: tds[6]
         price_span = price_td.find("span", class_="listing-price")
         price_text = price_span.get_text(strip=True) if price_span else price_td.get_text(strip=True)
-        price      = _parse_price(price_text)
+        price = _parse_price(price_text)
 
         if price is None:
             return None
 
-        # separator=" " ile boşlukları koru → birleşik kelime sorununu önle
-        location_text = tds[8].get_text(separator=" ", strip=True) if len(tds) > 8 else ""
-        location      = _parse_location(location_text)
-        paket         = _extract_paket(model_full, marka, model_query)
-        detail_url    = _get_detail_url(row)
+        location_text = tds[7].get_text(separator=" ", strip=True) if len(tds) > 7 else ""  # eskisi: tds[8]
+        location = _parse_location(location_text)
+        paket = _extract_paket(model_full, marka, model_query)
+        detail_url = _get_detail_url(row)
 
         return {
-            "title":        title,
-            "price":        price,
-            "km":           km,
-            "year":         year,
-            "model":        model_query.title(),
-            "paket":        paket,
-            "location":     location,
-            "detail_url":   detail_url,
-            # Detay verileri sonra doldurulacak
-            "errors":        None,
-            "repaints":      None,
+            "title": title,
+            "price": price,
+            "km": km,
+            "year": year,
+            "model": model_query.title(),
+            "paket": paket,
+            "location": location,
+            "detail_url": detail_url,
+            "errors": None,
+            "repaints": None,
             "changed_parts": None,
-            "heavy_damage":  None,
+            "heavy_damage": None,
         }
 
     except Exception as e:
         logger.debug(f"Satır parse hatası: {e}")
         return None
-
-
 # ═══════════════════════════════════════════════════════
 #  ANA SCRAPE FONKSİYONU
 # ═══════════════════════════════════════════════════════
