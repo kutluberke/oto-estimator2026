@@ -36,13 +36,13 @@ logger = logging.getLogger(__name__)
 
 # ===== ADIM 1: SCRAPING =====
 
-def run_scrape(marka: str, model_query: str) -> pd.DataFrame:
+def run_scrape(marka: str, model_query: str, debug: bool = False) -> pd.DataFrame:
     from scraper import scrape_listings
     from data_cleaner import clean_data
 
     print(f"\n🔍  {marka.upper()} {model_query.upper()} için ilanlar çekiliyor...")
 
-    raw_df = scrape_listings(marka, model_query, save=True)
+    raw_df = scrape_listings(marka, model_query, save=True, debug=debug)
 
     if raw_df.empty:
         logger.error("Hiç ilan çekilemedi. Marka/model adlarını kontrol edin.")
@@ -187,6 +187,11 @@ Marka/Model URL formatı (arabam.com'daki gibi, küçük harf + tire):
         metavar="MODEL",
         help="URL formatında model (ör: tonale)",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="İlk başarılı sayfanın HTML'ini debug_page.html'e yaz; parse hatalarında TD içeriklerini göster",
+    )
 
     return parser
 
@@ -213,7 +218,7 @@ def main() -> None:
     y_all    = None
 
     if args.scrape:
-        clean_df = run_scrape(args.marka, args.model)
+        clean_df = run_scrape(args.marka, args.model, debug=args.debug)
 
     if args.train:
         result = run_train(df=clean_df)

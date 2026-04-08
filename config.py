@@ -1,6 +1,7 @@
 # config.py — Sabitler, URL şablonları, scraping ayarları
 
 import os
+import random as _random
 
 # ===== URL YAPILANDIRMASI =====
 BASE_URL = "https://www.arabam.com"
@@ -12,22 +13,110 @@ def build_search_url(marka: str, model: str, page: int = 1) -> str:
     """
     return f"{BASE_URL}/ikinci-el/otomobil/{marka}-{model}?page={page}"
 
-# ===== SCRAPING AYARLARI =====
-SCRAPE_CONFIG = {
-    "delay_min": 0.6,          # İstekler arası min bekleme (saniye)
-    "delay_max": 1.2,          # İstekler arası max bekleme (saniye)
-    "timeout": 12,             # HTTP timeout (saniye)
-    "max_retries": 3,          # Başarısız istek için max retry sayısı
-    "max_pages": 20,           # Scrape edilecek max sayfa (güvenlik sınırı)
-    "min_listings": 10,        # Model eğitimi için minimum ilan sayısı
+# ===== VERİ SINIRLAR =====
+DATA_BOUNDS = {
+    "price_min": 50_000,
+    "price_max": 15_000_000,
+    "km_min": 0,
+    "km_max": 500_000,
+    "year_min": 1990,
+    "year_max": 2026,
+    "rare_location_threshold": 5,
 }
 
-# ===== HTTP HEADERS =====
+TARGET_COLUMN = "price"
+
+# ===== SCRAPING AYARLARI =====
+SCRAPE_CONFIG = {
+    "delay_min": 1.5,
+    "delay_max": 3.0,
+    "delay_sigma": 0.4,     # gaussian jitter
+    "timeout": 15,
+    "max_retries": 4,
+    "max_pages": 20,
+    "min_listings": 10,
+    "detail_workers": 2,    # ThreadPoolExecutor worker sayısı (detay sayfaları)
+    "backoff_base": 8,      # üstel geri çekilme taban süresi (saniye)
+}
+
+# ===== USER-AGENT HAVUZU =====
+UA_POOL = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.4; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 OPR/110.0.0.0",
+]
+
+
+def get_random_headers(referer: str = None) -> dict:
+    """
+    UA havuzundan rastgele bir tarayıcı seç, uyumlu başlıklar döndür.
+    referer verilirse Referer başlığına eklenir.
+    """
+    ua = _random.choice(UA_POOL)
+    is_firefox = "Firefox" in ua
+    is_edge = "Edg/" in ua
+
+    headers = {
+        "User-Agent": ua,
+        "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,"
+            "image/avif,image/webp,image/apng,*/*;q=0.8"
+        ),
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+    }
+
+    if referer:
+        headers["Referer"] = referer
+
+    fetch_site = "same-origin" if referer and "arabam.com" in referer else "none"
+
+    if is_firefox:
+        headers.update({
+            "sec-fetch-dest": "document",
+            "sec-fetch-mode": "navigate",
+            "sec-fetch-site": fetch_site,
+            "sec-fetch-user": "?1",
+        })
+    else:
+        version = "124"
+        if is_edge:
+            headers["sec-ch-ua"] = (
+                f'"Microsoft Edge";v="{version}", "Chromium";v="{version}", "Not-A.Brand";v="99"'
+            )
+        else:
+            headers["sec-ch-ua"] = (
+                f'"Chromium";v="{version}", "Google Chrome";v="{version}", "Not-A.Brand";v="99"'
+            )
+        headers.update({
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+            "sec-fetch-dest": "document",
+            "sec-fetch-mode": "navigate",
+            "sec-fetch-site": fetch_site,
+            "sec-fetch-user": "?1",
+        })
+
+    return headers
+
+
+# ===== HTTP HEADERS (geriye dönük uyumluluk için) =====
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/122.0.0.0 Safari/537.36"
+        "Chrome/124.0.0.0 Safari/537.36"
     ),
     "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
     "Accept": (
@@ -37,37 +126,14 @@ HEADERS = {
     "Accept-Encoding": "gzip, deflate, br",
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
-}
-
-# ===== FEATURE TANIMLARI =====
-NUMERIC_FEATURES = ["km", "year", "errors", "repaints", "changed_parts"]
-CATEGORICAL_FEATURES = ["model", "paket", "location"]
-TARGET_COLUMN = "price"
-
-# Feature importance için görüntülenecek feature isimleri (Türkçe)
-FEATURE_DISPLAY_NAMES = {
-    "km":            "Kilometre",
-    "year":          "Yıl",
-    "age":           "Araç Yaşı",
-    "model":         "Model",
-    "paket":         "Paket / Donanım",
-    "errors":        "Hata",
-    "repaints":      "Boya",
-    "changed_parts": "Değişen",
-    "heavy_damage":  "Ağır Hasar Kaydı",
-    "condition_score": "Kondisyon Skoru",
-    "tramer":        "Tramer",
-}
-
-# ===== VERİ TEMİZLEME SINIRLAR =====
-DATA_BOUNDS = {
-    "km_min": 0,
-    "km_max": 600_000,
-    "year_min": 1990,
-    "year_max": 2026,
-    "price_min": 500_000,          # 500k TL altı saçma (2025-2026 Türkiye piyasası)
-    "price_max": 15_000_000,       # 15M TL üstü exotik (outlier)
-    "rare_location_threshold": 3,  # 3'ten az ilanı olan il → 'Diğer'
+    "Referer": "https://www.arabam.com/",
+    "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "sec-fetch-dest": "document",
+    "sec-fetch-mode": "navigate",
+    "sec-fetch-site": "same-origin",
+    "sec-fetch-user": "?1",
 }
 
 # ===== TRAMER ANAHTAR KELİMELER =====

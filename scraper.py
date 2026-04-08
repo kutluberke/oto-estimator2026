@@ -23,9 +23,16 @@ from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, Callable
 
+try:
+    import cloudscraper as _cloudscraper
+    _CLOUDSCRAPER_AVAILABLE = True
+except ImportError:
+    _CLOUDSCRAPER_AVAILABLE = False
+
 from config import (
     HEADERS, SCRAPE_CONFIG, DATA_BOUNDS,
     BASE_URL, RAW_DATA_PATH, build_search_url,
+    get_random_headers,
 )
 
 logger = logging.getLogger(__name__)
@@ -33,12 +40,48 @@ if not logger.handlers:
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s [%(levelname)s] %(message)s")
 
-# ── requests.Session — TCP bağlantısı yeniden kullanılır ──────────────────
-_session = requests.Session()
-_session.headers.update(HEADERS)
 
-# Thread-safe rate limiter — paralel isteklerin üst üste binmesini önler
+def _make_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update(get_random_headers())
+    return s
+
+
+_session = _make_session()
+
+
+def _warmup_session() -> None:
+    """İki adımlı warm-up: ana sayfa → kategori sayfası. Çerez oluşturur, insan gibi görünür."""
+    steps = [
+        ("https://www.arabam.com/", None),
+        ("https://www.arabam.com/ikinci-el/otomobil", "https://www.arabam.com/"),
+    ]
+    for url, referer in steps:
+        try:
+            _session.headers.update(get_random_headers(referer=referer))
+            _session.get(url, timeout=10)
+            delay = max(2.0, random.gauss(3.0, 0.6))
+            time.sleep(delay)
+        except Exception:
+            pass
+
+
+try:
+    _warmup_session()
+except Exception:
+    pass
+
 _rate_lock = threading.Lock()
+
+
+def _dump_debug_html(url: str, content: bytes, path: str = "debug_page.html") -> None:
+    """Ham HTML yanıtını dosyaya yaz. --debug bayrağı aktifken tetiklenir."""
+    try:
+        with open(path, "wb") as f:
+            f.write(content)
+        logger.info(f"Debug HTML kaydedildi: {path}  (URL: {url})")
+    except Exception as e:
+        logger.warning(f"Debug HTML kaydedilemedi: {e}")
 
 
 # ═══════════════════════════════════════════════════════
@@ -169,40 +212,76 @@ def _parse_condition_text(text: str) -> dict:
 #  HTTP
 # ═══════════════════════════════════════════════════════
 
-def _get(url: str, delay_after: bool = True, use_lock: bool = False) -> Optional[requests.Response]:
+def _get(
+    url: str,
+    delay_after: bool = True,
+    use_lock: bool = False,
+    referer: str = None,
+    debug: bool = False,
+) -> Optional[requests.Response]:
     """
-    Session tabanlı HTTP GET.
-    use_lock=True → paralel thread'lerde istekler arasına lock ile sıra koyar,
-    ama sleep lock DIŞINDA tutulur; böylece ağ isteği + parse paralel çalışır.
+    Session tabanlı HTTP GET — UA rotasyonu, üstel geri çekilme, cloudscraper fallback.
+    use_lock=True → paralel thread'lerde lock ile sıralı istek; sleep lock dışında.
     """
     cfg = SCRAPE_CONFIG
+    backoff_base = cfg.get("backoff_base", 8)
+
     for attempt in range(cfg["max_retries"]):
         try:
+            _session.headers.update(get_random_headers(referer=referer))
+
             if use_lock:
-                # Lock sadece tek seferlik token almak için — istek sırasını korur
                 with _rate_lock:
                     resp = _session.get(url, timeout=cfg["timeout"])
-                # Sleep lock dışında → diğer thread'ler aynı anda istek atabilir
-                time.sleep(random.uniform(0.3, 0.6))
+                time.sleep(max(0.3, random.gauss(0.5, 0.15)))
             else:
                 resp = _session.get(url, timeout=cfg["timeout"])
 
             if resp.status_code == 404:
                 return None
-            if resp.status_code in (429, 503):
-                wait = 20 * (attempt + 1)
-                logger.warning(f"Rate limit ({resp.status_code}). {wait}s bekleniyor...")
-                time.sleep(wait)
+
+            if resp.status_code == 403:
+                logger.warning(f"403 Forbidden (deneme {attempt + 1}): {url}")
+                # Son denemede cloudscraper fallback dene
+                if _CLOUDSCRAPER_AVAILABLE and attempt == cfg["max_retries"] - 1:
+                    logger.info("cloudscraper fallback deneniyor…")
+                    try:
+                        cs = _cloudscraper.create_scraper()
+                        cs.headers.update(get_random_headers(referer=referer))
+                        cs_resp = cs.get(url, timeout=cfg["timeout"])
+                        if cs_resp.status_code == 200:
+                            return cs_resp
+                    except Exception as ce:
+                        logger.warning(f"cloudscraper hatası: {ce}")
+                wait = backoff_base * (2 ** attempt) + random.gauss(0, 1.5)
+                time.sleep(max(wait, 1.0))
                 continue
+
+            if resp.status_code in (429, 503):
+                wait = backoff_base * (2 ** attempt) + random.gauss(0, 2.0)
+                logger.warning(f"Rate limit ({resp.status_code}). {wait:.1f}s bekleniyor…")
+                time.sleep(max(wait, 5.0))
+                continue
+
             resp.raise_for_status()
+
+            if debug:
+                _dump_debug_html(url, resp.content)
+
             if delay_after and not use_lock:
-                time.sleep(random.uniform(cfg["delay_min"], cfg["delay_max"]))
+                sigma = cfg.get("delay_sigma", 0.4)
+                mu = (cfg["delay_min"] + cfg["delay_max"]) / 2
+                delay = max(cfg["delay_min"], random.gauss(mu, sigma))
+                time.sleep(delay)
             return resp
+
         except requests.Timeout:
-            time.sleep(3 * (attempt + 1))
+            wait = backoff_base * (2 ** attempt)
+            time.sleep(wait)
         except requests.RequestException as e:
-            logger.warning(f"Request hatası (deneme {attempt+1}): {e}")
-            time.sleep(3 * (attempt + 1))
+            logger.warning(f"Request hatası (deneme {attempt + 1}): {e}")
+            wait = backoff_base * (2 ** attempt)
+            time.sleep(wait)
     return None
 
 
@@ -250,10 +329,16 @@ def _scrape_detail(url: str) -> dict:
 #  LİSTİNG SATIRI PARSE
 # ═══════════════════════════════════════════════════════
 
-def _parse_row(row, marka: str, model_query: str) -> Optional[dict]:
+def _parse_row(row, marka: str, model_query: str, debug: bool = False) -> Optional[dict]:
+    tds = []
     try:
         tds = row.find_all("td")
         if len(tds) < 6:
+            if debug:
+                logger.debug(
+                    f"Yetersiz TD ({len(tds)}): "
+                    f"{[td.get_text(strip=True)[:30] for td in tds]}"
+                )
             return None
 
         model_full = tds[1].get_text(strip=True)
@@ -297,7 +382,13 @@ def _parse_row(row, marka: str, model_query: str) -> Optional[dict]:
         }
 
     except Exception as e:
-        logger.debug(f"Satır parse hatası: {e}")
+        if debug:
+            logger.debug(
+                f"Satır parse hatası: {e} | "
+                f"TDs: {[td.get_text(strip=True)[:30] for td in tds]}"
+            )
+        else:
+            logger.debug(f"Satır parse hatası: {e}")
         return None
 # ═══════════════════════════════════════════════════════
 #  ANA SCRAPE FONKSİYONU
@@ -310,6 +401,7 @@ def scrape_listings(
     max_pages: int = None,
     fetch_details: bool = True,
     progress_callback: Callable = None,
+    debug: bool = False,
 ) -> pd.DataFrame:
     """
     arabam.com'dan marka+model için ilanları çek.
@@ -321,22 +413,27 @@ def scrape_listings(
         max_pages        : Sayfa limiti (None = config default)
         fetch_details    : True ise detay sayfasından hata/boya/değişen çeker
         progress_callback: (page, total, status_msg) callable
+        debug            : True ise ilk başarılı sayfanın HTML'ini debug_page.html'e yazar
     """
-    logger.info(f"Scraping: {marka} / {model_query} | detay={fetch_details}")
+    logger.info(f"Scraping: {marka} / {model_query} | detay={fetch_details} | debug={debug}")
 
     cfg   = SCRAPE_CONFIG
     limit = max_pages or cfg["max_pages"]
     all_listings: list = []
     consecutive_empty = 0
+    _debug_dumped = False  # HTML'i yalnızca ilk kez yaz
 
     # ── Listing sayfaları ────────────────────────────────
     for page in range(1, limit + 1):
         url = build_search_url(marka, model_query, page)
+        referer = build_search_url(marka, model_query, page - 1) if page > 1 else "https://www.arabam.com/ikinci-el/otomobil"
 
         if progress_callback:
             progress_callback(page, len(all_listings), f"Sayfa {page}/{limit} taranıyor…")
 
-        resp = _get(url)
+        resp = _get(url, referer=referer, debug=debug and not _debug_dumped)
+        if resp is not None and debug and not _debug_dumped:
+            _debug_dumped = True
         if resp is None:
             consecutive_empty += 1
             if consecutive_empty >= 2:
@@ -354,7 +451,7 @@ def scrape_listings(
 
         consecutive_empty = 0
         for row in rows:
-            listing = _parse_row(row, marka, model_query)
+            listing = _parse_row(row, marka, model_query, debug=debug)
             if listing:
                 all_listings.append(listing)
 
@@ -371,7 +468,7 @@ def scrape_listings(
         total   = len(df)
         found   = 0
         done    = 0
-        MAX_WORKERS = 5   # arabam.com'a aynı anda max 5 thread
+        MAX_WORKERS = SCRAPE_CONFIG.get("detail_workers", 2)
 
         logger.info(f"Detay sayfaları paralel çekiliyor ({total} ilan, {MAX_WORKERS} thread)…")
 
