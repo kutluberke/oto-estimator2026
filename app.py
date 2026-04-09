@@ -304,7 +304,8 @@ def _run_scrape(mode: str, marka: str, model: str, max_pages: int):
     log_area = st.empty()
     log_lines: list[str] = []
 
-    def cb(msg: str, pct: float = 0.0):
+    def cb(current, total, msg: str = ""):
+        pct = (current / total) if total else 0.0
         log_lines.append(msg)
         if len(log_lines) > 6:
             log_lines.pop(0)
