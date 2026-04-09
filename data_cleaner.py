@@ -19,25 +19,39 @@ def _convert_types(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
     numeric_cols = {
-        "price":         "float",
-        "km":            "float",
-        "year":          "int",
-        "errors":        "float",  # float çünkü NaN kabul eder
-        "repaints":      "float",
-        "changed_parts": "float",
-        "tramer":        "float",
+        "price":               "float",
+        "km":                  "float",
+        "year":                "int",
+        # Legacy damage
+        "errors":              "float",
+        "repaints":            "float",
+        "changed_parts":       "float",
+        "heavy_damage":        "float",
+        # New damage
+        "has_original_paint":  "float",
+        "painted_panel_count": "float",
+        "changed_panel_count": "float",
+        "has_local_paint":     "float",
+        "total_damage_score":  "float",
+        # Spec fields
+        "hp":                  "float",
+        "warranty":            "float",
+        "from_dealer":         "float",
+        "num_owners":          "float",
     }
 
     for col, dtype in numeric_cols.items():
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # Yıl için özel: float'tan int'e (NaN olanları korumak için Int64 kullan)
+    # Yıl: float → nullable int
     if "year" in df.columns:
-        df["year"] = df["year"].astype("Int64")  # Nullable integer
+        df["year"] = df["year"].astype("Int64")
 
     # String sütunlar: boşluk temizle
-    for col in ["model", "paket", "location", "title"]:
+    str_cols = ["brand", "model", "paket", "location", "title",
+                "fuel_type", "transmission", "body_type", "color", "engine_cc"]
+    for col in str_cols:
         if col in df.columns:
             df[col] = df[col].astype(str).str.strip()
             df[col] = df[col].replace({"nan": None, "None": None, "": None})
@@ -59,8 +73,18 @@ def _remove_outliers(df: pd.DataFrame) -> pd.DataFrame:
     df = df[df["km"].between(DATA_BOUNDS["km_min"], DATA_BOUNDS["km_max"])]
     df = df[df["year"].between(DATA_BOUNDS["year_min"], DATA_BOUNDS["year_max"])]
 
-    # 2. IQR bazlı fiyat outlier temizliği
-    if len(df) > 20:
+    # 2. IQR bazlı fiyat outlier temizliği (brand bazında)
+    if len(df) > 20 and "brand" in df.columns:
+        brand_groups = []
+        for brand, grp in df.groupby("brand"):
+            if len(grp) < 10:
+                brand_groups.append(grp)
+                continue
+            q_lo = grp["price"].quantile(0.025)
+            q_hi = grp["price"].quantile(0.975)
+            brand_groups.append(grp[grp["price"].between(q_lo, q_hi)])
+        df = pd.concat(brand_groups, ignore_index=True)
+    elif len(df) > 20:
         Q1 = df["price"].quantile(0.10)
         Q3 = df["price"].quantile(0.90)
         IQR = Q3 - Q1
@@ -85,13 +109,9 @@ def _handle_missing(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     initial = len(df)
 
-    # Kritik (olmazsa olmaz)
     df = df.dropna(subset=["price", "km"])
-
-    # Year eksikse de atla
     df = df.dropna(subset=["year"])
 
-    # Konum eksikse "Bilinmiyor" yaz
     if "location" in df.columns:
         df["location"] = df["location"].fillna("Bilinmiyor")
 
@@ -105,13 +125,9 @@ def _handle_missing(df: pd.DataFrame) -> pd.DataFrame:
 # ===== DUPLIKASYON =====
 
 def _remove_duplicates(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Aynı ilan birden fazla kez çekildiyse ilk kayıt kalır.
-    """
     df = df.copy()
     initial = len(df)
 
-    # Title + price + km kombinasyonuna göre
     subset = [c for c in ["title", "price", "km"] if c in df.columns]
     if subset:
         df = df.drop_duplicates(subset=subset, keep="first")
@@ -126,15 +142,10 @@ def _remove_duplicates(df: pd.DataFrame) -> pd.DataFrame:
 # ===== KONUM NORMALİZASYONU =====
 
 def _normalize_location(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    İl adlarını standartlaştır (büyük/küçük harf, yaygın hatalar).
-    """
     if "location" not in df.columns:
         return df
 
     df = df.copy()
-
-    # İstanbul yazım varyasyonları
     df["location"] = df["location"].replace({
         "istanbul": "İstanbul",
         "ISTANBUL": "İstanbul",
@@ -143,21 +154,15 @@ def _normalize_location(df: pd.DataFrame) -> pd.DataFrame:
         "izmir": "İzmir",
         "IZMIR": "İzmir",
     })
-
-    # İlk harf büyük (genel kural)
     df["location"] = df["location"].apply(
         lambda x: x.strip().title() if isinstance(x, str) else x
     )
-
     return df
 
 
 # ===== VERİ KALİTE KONTROLÜ =====
 
 def validate_dataset(df: pd.DataFrame, min_listings: int = 10) -> None:
-    """
-    Dataset kalitesini kontrol et. Yetersizse ValueError fırlatır.
-    """
     issues = []
 
     if len(df) < min_listings:
@@ -192,23 +197,23 @@ def print_summary(df: pd.DataFrame) -> None:
     print(f"  KM (max)           : {df['km'].max():>12,.0f}")
     print(f"  Yıl aralığı        : {int(df['year'].min())} – {int(df['year'].max())}")
 
+    if "brand" in df.columns:
+        brands = df["brand"].value_counts().head(5)
+        print(f"\n  En sık marka:")
+        for brand, cnt in brands.items():
+            print(f"    {brand:<22} {cnt} ilan")
+
     if "location" in df.columns:
         top_locations = df["location"].value_counts().head(5)
         print(f"\n  En sık konum:")
         for loc, cnt in top_locations.items():
-            print(f"    {loc:<20} {cnt} ilan")
-
-    if "paket" in df.columns:
-        top_packets = df["paket"].value_counts().head(5)
-        print(f"\n  En sık paket:")
-        for pkt, cnt in top_packets.items():
-            print(f"    {str(pkt):<30} {cnt} ilan")
+            print(f"    {loc:<22} {cnt} ilan")
 
     print(f"\n  Eksik değerler:")
     missing = df.isnull().sum()
     for col, cnt in missing[missing > 0].items():
         pct = cnt / len(df) * 100
-        print(f"    {col:<20} {cnt} ({pct:.1f}%)")
+        print(f"    {col:<25} {cnt} ({pct:.1f}%)")
 
     print(f"{'='*55}\n")
 
@@ -218,43 +223,37 @@ def print_summary(df: pd.DataFrame) -> None:
 def clean_data(raw_df: pd.DataFrame, save: bool = True) -> pd.DataFrame:
     """
     Ham DataFrame'i alır, temizler, validate eder ve döner.
-
-    Parametreler:
-        raw_df : scraper.py'den gelen ham DataFrame
-        save   : True ise CLEANED_DATA_PATH'e kaydeder
-
-    Dönüş:
-        Temiz pd.DataFrame
     """
     logger.info(f"Temizleme başlıyor: {len(raw_df)} ham ilan")
 
     df = raw_df.copy()
 
-    # Pipeline
     df = _convert_types(df)
     df = _remove_duplicates(df)
     df = _handle_missing(df)
     df = _remove_outliers(df)
     df = _normalize_location(df)
 
-    # Reset index
     df = df.reset_index(drop=True)
 
-    # Validasyon
     validate_dataset(df)
-
-    # Özet
     print_summary(df)
 
     if save:
-        df.to_csv(CLEANED_DATA_PATH, index=False, encoding="utf-8-sig")
-        logger.info(f"Temiz veri kaydedildi: {CLEANED_DATA_PATH}")
+        try:
+            CLEANED_DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
+            df.to_csv(CLEANED_DATA_PATH, index=False, encoding="utf-8-sig")
+            logger.info(f"Temiz veri kaydedildi: {CLEANED_DATA_PATH}")
+        except OSError as e:
+            logger.warning(f"CSV kaydetme hatası (devam ediliyor): {e}")
 
     return df
 
 
 # ===== TEST =====
 if __name__ == "__main__":
-    df_raw = pd.read_csv("data/raw_listings.csv")
+    from pathlib import Path
+    csv_path = Path("data/raw_listings.csv")
+    df_raw = pd.read_csv(csv_path)
     df_clean = clean_data(df_raw, save=True)
     print(df_clean.head())

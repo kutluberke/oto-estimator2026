@@ -21,6 +21,7 @@ data/*.json
 models/*.pkl
 models/*.joblib
 models/*.json
+models/*.csv
 plots/*.png
 plots/*.jpg
 

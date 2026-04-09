@@ -1,22 +1,20 @@
-# scraper.py — arabam.com ikinci el ilan scraper
+# scraper.py — arabam.com ikinci el ilan scraper (genişletilmiş)
 #
-# Gerçek HTML yapısı (debug ile doğrulandı):
+# HTML yapısı (debug ile doğrulandı):
 #   <tr class='listing-list-item should-hover bg-white'>
 #     td[0] → boş (resim)
-#     td[1] class='listing-modelname pr'          → Model adı + detay linki
-#     td[2] class='horizontal-half-padder-minus'  → İlan başlığı
-#     td[3] class='listing-text'                  → Yıl
-#     td[4] class='listing-text'                  → KM
-#     td[5] class='listing-text'                  → Renk
-#     td[6] class=''                               → Fiyat
-#     td[7] class='listing-text tac'              → Tarih
-#     td[8] class='listing-text'                  → Konum
+#     td[1] → Model adı + detay linki
+#     td[2] → Yıl
+#     td[3] → KM
+#     td[5] → Fiyat
+#     td[7] → Konum
 
 import re
 import time
 import random
 import logging
 import threading
+from datetime import datetime, timezone
 import requests
 import pandas as pd
 from bs4 import BeautifulSoup
@@ -31,8 +29,8 @@ except ImportError:
 
 from config import (
     HEADERS, SCRAPE_CONFIG, DATA_BOUNDS,
-    BASE_URL, RAW_DATA_PATH, build_search_url,
-    get_random_headers,
+    BASE_URL, RAW_DATA_PATH, build_search_url, build_category_url,
+    get_random_headers, CATEGORY_URLS,
 )
 
 logger = logging.getLogger(__name__)
@@ -51,7 +49,6 @@ _session = _make_session()
 
 
 def _warmup_session() -> None:
-    """İki adımlı warm-up: ana sayfa → kategori sayfası. Çerez oluşturur, insan gibi görünür."""
     steps = [
         ("https://www.arabam.com/", None),
         ("https://www.arabam.com/ikinci-el/otomobil", "https://www.arabam.com/"),
@@ -60,8 +57,7 @@ def _warmup_session() -> None:
         try:
             _session.headers.update(get_random_headers(referer=referer))
             _session.get(url, timeout=10)
-            delay = max(2.0, random.gauss(3.0, 0.6))
-            time.sleep(delay)
+            time.sleep(max(2.0, random.gauss(3.0, 0.6)))
         except Exception:
             pass
 
@@ -75,7 +71,6 @@ _rate_lock = threading.Lock()
 
 
 def _dump_debug_html(url: str, content: bytes, path: str = "debug_page.html") -> None:
-    """Ham HTML yanıtını dosyaya yaz. --debug bayrağı aktifken tetiklenir."""
     try:
         with open(path, "wb") as f:
             f.write(content)
@@ -104,9 +99,6 @@ def _parse_price(text: str) -> Optional[float]:
 
 
 def _parse_km(text: str) -> Optional[float]:
-    """
-    "115.000" (nokta = binlik ayraç, km suffix YOK) → 115000.0
-    """
     if not text:
         return None
     cleaned = re.sub(r"[^\d]", "", text.strip())
@@ -135,9 +127,6 @@ def _parse_year(text: str) -> Optional[int]:
 
 
 def _parse_location(text: str) -> Optional[str]:
-    """
-    "İstanbul Bağcılar Karşılaştır..." → "İstanbul"
-    """
     if not text:
         return None
     noise = {"karşılaştır", "favorilerimde", "favoriye", "ekle", "çıkar", "gi̇", "gir"}
@@ -145,15 +134,11 @@ def _parse_location(text: str) -> Optional[str]:
     for word in words:
         if word.lower() in noise:
             break
-        # İl = ilk kelime
         return word
     return None
 
 
 def _extract_paket(model_full: str, marka: str, model_query: str) -> str:
-    """
-    "Alfa Romeo Tonale 1.5 Hybrid Veloce" → "1.5 Hybrid Veloce"
-    """
     text = model_full.strip()
     for word in marka.replace("-", " ").split():
         text = re.sub(re.escape(word), "", text, flags=re.IGNORECASE)
@@ -164,34 +149,20 @@ def _extract_paket(model_full: str, marka: str, model_query: str) -> str:
 
 
 def _parse_condition_text(text: str) -> dict:
-    """
-    "0 boya 2 değişen 0 hata" → {'repaints': 0, 'changed_parts': 2, 'errors': 0}
-    "Ağır Hasar Kaydı: Var"   → {'heavy_damage': 1}
+    result = {"errors": None, "repaints": None, "changed_parts": None, "heavy_damage": None}
 
-    Repaints/errors/changed_parts için maksimum 2 basamak sınırı var
-    (detay sayfasındaki fiyat rakamlarının yanlışlıkla eşleşmesini önler).
-    """
-    result = {
-        "errors": None, "repaints": None,
-        "changed_parts": None, "heavy_damage": None,
-    }
-
-    # 1-2 basamaklı sayı + "hata" (max 30 parça mantıklı sınır)
     m = re.search(r"\b(\d{1,2})\s*hata\b", text, re.IGNORECASE)
     if m and int(m.group(1)) <= 30:
         result["errors"] = int(m.group(1))
 
-    # 1-2 basamaklı sayı + "boya"
     m = re.search(r"\b(\d{1,2})\s*boya\b", text, re.IGNORECASE)
     if m and int(m.group(1)) <= 30:
         result["repaints"] = int(m.group(1))
 
-    # 1-2 basamaklı sayı + "değişen/degisen"
     m = re.search(r"\b(\d{1,2})\s*de[gğ]i[şs]en\b", text, re.IGNORECASE)
     if m and int(m.group(1)) <= 30:
         result["changed_parts"] = int(m.group(1))
 
-    # Ağır hasar kaydı — "Var" → 1, "Yok" → 0
     m = re.search(
         r"a[gğ][iı]r\s+hasar\s+kayd[iı]\s*[:\-]?\s*(var|yok)",
         text, re.IGNORECASE
@@ -199,10 +170,12 @@ def _parse_condition_text(text: str) -> dict:
     if m:
         result["heavy_damage"] = 1 if m.group(1).lower() == "var" else 0
     else:
-        # Alternatif: sadece "ağır hasar var" ifadesi
         if re.search(r"a[gğ][iı]r\s+hasar\s+var", text, re.IGNORECASE):
             result["heavy_damage"] = 1
-        elif re.search(r"a[gğ][iı]r\s+hasar\s+yok|a[gğ][iı]r\s+hasar\s+kayd[iı]\s+bulunmamak", text, re.IGNORECASE):
+        elif re.search(
+            r"a[gğ][iı]r\s+hasar\s+yok|a[gğ][iı]r\s+hasar\s+kayd[iı]\s+bulunmamak",
+            text, re.IGNORECASE
+        ):
             result["heavy_damage"] = 0
 
     return result
@@ -219,10 +192,6 @@ def _get(
     referer: str = None,
     debug: bool = False,
 ) -> Optional[requests.Response]:
-    """
-    Session tabanlı HTTP GET — UA rotasyonu, üstel geri çekilme, cloudscraper fallback.
-    use_lock=True → paralel thread'lerde lock ile sıralı istek; sleep lock dışında.
-    """
     cfg = SCRAPE_CONFIG
     backoff_base = cfg.get("backoff_base", 8)
 
@@ -242,7 +211,6 @@ def _get(
 
             if resp.status_code == 403:
                 logger.warning(f"403 Forbidden (deneme {attempt + 1}): {url}")
-                # Son denemede cloudscraper fallback dene
                 if _CLOUDSCRAPER_AVAILABLE and attempt == cfg["max_retries"] - 1:
                     logger.info("cloudscraper fallback deneniyor…")
                     try:
@@ -276,24 +244,18 @@ def _get(
             return resp
 
         except requests.Timeout:
-            wait = backoff_base * (2 ** attempt)
-            time.sleep(wait)
+            time.sleep(backoff_base * (2 ** attempt))
         except requests.RequestException as e:
             logger.warning(f"Request hatası (deneme {attempt + 1}): {e}")
-            wait = backoff_base * (2 ** attempt)
-            time.sleep(wait)
+            time.sleep(backoff_base * (2 ** attempt))
     return None
 
 
 # ═══════════════════════════════════════════════════════
-#  DETAY SAYFASI — hata / boya / değişen
+#  DETAY SAYFASI
 # ═══════════════════════════════════════════════════════
 
 def _get_detail_url(row) -> Optional[str]:
-    """
-    Listing satırındaki detay sayfası URL'sini bul.
-    arabam.com'da td[1] veya td[2] içindeki <a> ile '/ilan/' path'i.
-    """
     for a_tag in row.find_all("a", href=True):
         href = a_tag["href"]
         if "/ilan/" in href:
@@ -301,13 +263,166 @@ def _get_detail_url(row) -> Optional[str]:
     return None
 
 
+def _parse_damage_table(soup: BeautifulSoup) -> dict:
+    result = {
+        "has_original_paint": None,
+        "painted_panel_count": None,
+        "changed_panel_count": None,
+        "has_local_paint": None,
+        "total_damage_score": None,
+    }
+
+    painted = 0
+    changed = 0
+    has_local = False
+    found_table = False
+
+    damage_table = soup.find("table", class_=re.compile(r"damage|hasar", re.I))
+    if damage_table is None:
+        for tag in soup.find_all(["h2", "h3", "div"],
+                                  string=re.compile(r"hasar|damage", re.I)):
+            parent = tag.find_parent(["section", "div", "table"])
+            if parent:
+                damage_table = parent
+                break
+
+    if damage_table:
+        found_table = True
+        cells = damage_table.find_all(["td", "li", "span"])
+        for cell in cells:
+            text = cell.get_text(strip=True).lower()
+            if "boyalı" in text or ("boya" in text and "orijinal" not in text
+                                    and "lokal" not in text):
+                try:
+                    num = int(re.search(r"\d+", text).group())
+                    painted += num
+                except (AttributeError, ValueError):
+                    painted += 1
+            elif "değişen" in text or "degisen" in text:
+                try:
+                    num = int(re.search(r"\d+", text).group())
+                    changed += num
+                except (AttributeError, ValueError):
+                    changed += 1
+            elif "lokal" in text:
+                has_local = True
+
+    page_text = soup.get_text(separator=" ", strip=True)
+    cond = _parse_condition_text(page_text)
+
+    if not found_table:
+        if cond["repaints"] is not None:
+            painted = cond["repaints"]
+        if cond["changed_parts"] is not None:
+            changed = cond["changed_parts"]
+
+    has_original = (painted == 0 and changed == 0)
+    if re.search(r"boyasız|tramer\s+yok|hasar\s+kayd[iı]\s+yok", page_text, re.IGNORECASE):
+        has_original = True
+
+    result["has_original_paint"] = int(has_original)
+    result["painted_panel_count"] = painted
+    result["changed_panel_count"] = changed
+    result["has_local_paint"] = int(has_local)
+    result["total_damage_score"] = painted + changed * 2
+
+    return result
+
+
+def _parse_spec_table(soup: BeautifulSoup) -> dict:
+    result = {
+        "fuel_type": None, "transmission": None, "body_type": None,
+        "engine_cc": None, "hp": None, "color": None,
+        "warranty": None, "from_dealer": None, "num_owners": None,
+    }
+
+    page_text = soup.get_text(separator="\n", strip=True)
+
+    fuel_map = {
+        "benzin": "Benzin", "dizel": "Dizel", "lpg": "LPG",
+        "hibrit": "Hibrit", "hybrid": "Hibrit",
+        "elektrik": "Elektrik", "electric": "Elektrik",
+    }
+    for kw, val in fuel_map.items():
+        if re.search(kw, page_text, re.IGNORECASE):
+            result["fuel_type"] = val
+            break
+
+    if re.search(r"otomatik|automatic", page_text, re.IGNORECASE):
+        result["transmission"] = "Otomatik"
+    elif re.search(r"yarı\s*otomatik|semi[\s-]auto", page_text, re.IGNORECASE):
+        result["transmission"] = "Yarı Otomatik"
+    elif re.search(r"manuel|manual|düz\s*vites", page_text, re.IGNORECASE):
+        result["transmission"] = "Manuel"
+
+    body_map = {
+        r"sedan": "Sedan",
+        r"hatchback|hatch\s*back": "Hatchback",
+        r"suv|arazi": "SUV",
+        r"station\s*wagon|steyşın|station": "Station Wagon",
+        r"coupe|kupe": "Coupe",
+        r"cabrio|convertible|cabriolet": "Cabrio",
+        r"mpv|minivan|van": "MPV",
+        r"pickup|kamyonet": "Pickup",
+    }
+    for pattern, val in body_map.items():
+        if re.search(pattern, page_text, re.IGNORECASE):
+            result["body_type"] = val
+            break
+
+    m = re.search(r"\b(\d[.,]\d)\s*(?:lt?|litre?|cc|cm3)?\b", page_text, re.IGNORECASE)
+    if m:
+        result["engine_cc"] = m.group(1).replace(",", ".")
+
+    m = re.search(r"\b(\d{2,4})\s*(?:hp|beygir|bg|ps|kw)\b", page_text, re.IGNORECASE)
+    if m:
+        try:
+            hp_val = int(m.group(1))
+            if 30 <= hp_val <= 1500:
+                result["hp"] = hp_val
+        except ValueError:
+            pass
+
+    color_keywords = [
+        "Beyaz", "Siyah", "Gri", "Gümüş", "Kırmızı", "Mavi", "Yeşil",
+        "Sarı", "Turuncu", "Kahverengi", "Bej", "Bordo", "Lacivert",
+        "Mor", "Pembe", "Altın", "Bronz",
+    ]
+    for color in color_keywords:
+        if re.search(color, page_text, re.IGNORECASE):
+            result["color"] = color
+            break
+
+    result["warranty"] = 1 if re.search(
+        r"garantili|garanti\s+var|fabrika\s+garanti", page_text, re.IGNORECASE
+    ) else 0
+
+    if re.search(r"galeriden|galeri\s+ilan|yetkili\s+sat", page_text, re.IGNORECASE):
+        result["from_dealer"] = 1
+    elif re.search(r"sahibinden|bireysel\s+ilan", page_text, re.IGNORECASE):
+        result["from_dealer"] = 0
+
+    m = re.search(r"(\d+)\.\s*el\b|(\d+)\s*el\b", page_text, re.IGNORECASE)
+    if m:
+        try:
+            owners = int(m.group(1) or m.group(2))
+            if 1 <= owners <= 10:
+                result["num_owners"] = owners
+        except (ValueError, TypeError):
+            pass
+
+    return result
+
+
 def _scrape_detail(url: str) -> dict:
-    """
-    Detay sayfasından hata/boya/değişen parse et.
-    use_lock=True: paralel thread'lerde rate limiting için lock kullanır.
-    Başarısız olursa hepsi None döner.
-    """
-    empty = {"errors": None, "repaints": None, "changed_parts": None}
+    empty = {
+        "errors": None, "repaints": None, "changed_parts": None, "heavy_damage": None,
+        "has_original_paint": None, "painted_panel_count": None,
+        "changed_panel_count": None, "has_local_paint": None, "total_damage_score": None,
+        "fuel_type": None, "transmission": None, "body_type": None,
+        "engine_cc": None, "hp": None, "color": None,
+        "warranty": None, "from_dealer": None, "num_owners": None,
+    }
     if not url:
         return empty
 
@@ -315,58 +430,68 @@ def _scrape_detail(url: str) -> dict:
     if resp is None:
         return empty
 
-    soup = BeautifulSoup(resp.content, "html.parser")
-    page_text = soup.get_text(separator=" ", strip=True)
-    condition = _parse_condition_text(page_text)
+    try:
+        soup = BeautifulSoup(resp.content, "html.parser")
+        page_text = soup.get_text(separator=" ", strip=True)
 
-    if any(v is not None for v in condition.values()):
-        return condition
+        cond = _parse_condition_text(page_text)
+        result = dict(empty)
+        result.update(cond)
+        result.update(_parse_damage_table(soup))
+        result.update(_parse_spec_table(soup))
 
-    return empty
+        return result
+
+    except Exception as e:
+        logger.debug(f"Detay parse hatası ({url}): {e}")
+        return empty
 
 
 # ═══════════════════════════════════════════════════════
 #  LİSTİNG SATIRI PARSE
 # ═══════════════════════════════════════════════════════
 
+def _empty_listing_fields() -> dict:
+    return {
+        "fuel_type": None, "transmission": None, "body_type": None,
+        "engine_cc": None, "hp": None, "color": None,
+        "warranty": None, "from_dealer": None, "num_owners": None,
+        "has_original_paint": None, "painted_panel_count": None,
+        "changed_panel_count": None, "has_local_paint": None, "total_damage_score": None,
+        "errors": None, "repaints": None, "changed_parts": None, "heavy_damage": None,
+    }
+
+
 def _parse_row(row, marka: str, model_query: str, debug: bool = False) -> Optional[dict]:
     tds = []
     try:
         tds = row.find_all("td")
         if len(tds) < 6:
-            if debug:
-                logger.debug(
-                    f"Yetersiz TD ({len(tds)}): "
-                    f"{[td.get_text(strip=True)[:30] for td in tds]}"
-                )
             return None
 
         model_full = tds[1].get_text(strip=True)
+        title_div  = tds[1].find("div", class_="listing-title-lines")
+        title      = title_div.get_text(strip=True) if title_div else model_full
 
-        # Başlık artık td[1] içindeki div'de
-        title_div = tds[1].find("div", class_="listing-title-lines")
-        title = title_div.get_text(strip=True) if title_div else model_full
-
-        year = _parse_year(tds[2].get_text(strip=True))  # eskisi: tds[3]
-        km = _parse_km(tds[3].get_text(strip=True))  # eskisi: tds[4]
-
+        year  = _parse_year(tds[2].get_text(strip=True))
+        km    = _parse_km(tds[3].get_text(strip=True))
         if km is None:
             return None
 
-        price_td = tds[5]  # eskisi: tds[6]
+        price_td   = tds[5]
         price_span = price_td.find("span", class_="listing-price")
         price_text = price_span.get_text(strip=True) if price_span else price_td.get_text(strip=True)
-        price = _parse_price(price_text)
-
+        price      = _parse_price(price_text)
         if price is None:
             return None
 
-        location_text = tds[7].get_text(separator=" ", strip=True) if len(tds) > 7 else ""  # eskisi: tds[8]
-        location = _parse_location(location_text)
-        paket = _extract_paket(model_full, marka, model_query)
-        detail_url = _get_detail_url(row)
+        location_text = tds[7].get_text(separator=" ", strip=True) if len(tds) > 7 else ""
+        location      = _parse_location(location_text)
+        paket         = _extract_paket(model_full, marka, model_query)
+        detail_url    = _get_detail_url(row)
 
-        return {
+        listing = {
+            "brand": marka.replace("-", " ").title(),
             "title": title,
             "price": price,
             "km": km,
@@ -375,23 +500,139 @@ def _parse_row(row, marka: str, model_query: str, debug: bool = False) -> Option
             "paket": paket,
             "location": location,
             "detail_url": detail_url,
-            "errors": None,
-            "repaints": None,
-            "changed_parts": None,
-            "heavy_damage": None,
         }
+        listing.update(_empty_listing_fields())
+        return listing
 
     except Exception as e:
-        if debug:
-            logger.debug(
-                f"Satır parse hatası: {e} | "
-                f"TDs: {[td.get_text(strip=True)[:30] for td in tds]}"
-            )
-        else:
-            logger.debug(f"Satır parse hatası: {e}")
+        logger.debug(f"Satır parse hatası: {e}")
         return None
+
+
+def _parse_category_row(row, category_slug: str, debug: bool = False) -> Optional[dict]:
+    tds = []
+    try:
+        tds = row.find_all("td")
+        if len(tds) < 6:
+            return None
+
+        model_full = tds[1].get_text(strip=True)
+        title_div  = tds[1].find("div", class_="listing-title-lines")
+        title      = title_div.get_text(strip=True) if title_div else model_full
+
+        # brand/model'i URL'den çıkar
+        detail_a = tds[1].find("a", href=True)
+        brand = ""
+        model = ""
+        if detail_a:
+            href = detail_a.get("href", "")
+            m = re.search(r"/ikinci-el/[^/]+/([^/]+)-([^/?]+)", href)
+            if m:
+                brand = m.group(1).replace("-", " ").title()
+                model = m.group(2).replace("-", " ").title()
+        if not brand:
+            parts = model_full.split()
+            brand = parts[0] if parts else ""
+            model = " ".join(parts[1:2]) if len(parts) > 1 else ""
+
+        year = _parse_year(tds[2].get_text(strip=True))
+        km   = _parse_km(tds[3].get_text(strip=True))
+        if km is None:
+            return None
+
+        price_td   = tds[5]
+        price_span = price_td.find("span", class_="listing-price")
+        price_text = price_span.get_text(strip=True) if price_span else price_td.get_text(strip=True)
+        price      = _parse_price(price_text)
+        if price is None:
+            return None
+
+        location_text = tds[7].get_text(separator=" ", strip=True) if len(tds) > 7 else ""
+        location      = _parse_location(location_text)
+        detail_url    = _get_detail_url(row)
+
+        listing = {
+            "brand": brand,
+            "title": title,
+            "price": price,
+            "km": km,
+            "year": year,
+            "model": model,
+            "paket": model_full,
+            "location": location,
+            "detail_url": detail_url,
+        }
+        listing.update(_empty_listing_fields())
+        return listing
+
+    except Exception as e:
+        logger.debug(f"Kategori satır parse hatası: {e}")
+        return None
+
+
 # ═══════════════════════════════════════════════════════
-#  ANA SCRAPE FONKSİYONU
+#  DETAY SAYFALARINI PARALEL DOLDUR
+# ═══════════════════════════════════════════════════════
+
+DETAIL_FIELDS = [
+    "errors", "repaints", "changed_parts", "heavy_damage",
+    "has_original_paint", "painted_panel_count", "changed_panel_count",
+    "has_local_paint", "total_damage_score",
+    "fuel_type", "transmission", "body_type",
+    "engine_cc", "hp", "color",
+    "warranty", "from_dealer", "num_owners",
+]
+
+
+def _fill_detail_pages(df: pd.DataFrame, progress_callback: Callable = None) -> pd.DataFrame:
+    total      = len(df)
+    found      = 0
+    done       = 0
+    MAX_WORKERS = SCRAPE_CONFIG.get("detail_workers", 2)
+
+    logger.info(f"Detay sayfaları çekiliyor ({total} ilan, {MAX_WORKERS} thread)…")
+
+    tasks = [
+        (idx, row["detail_url"])
+        for idx, row in df.iterrows()
+        if row.get("detail_url")
+    ]
+
+    _done_lock = threading.Lock()
+
+    def _fetch(idx_url):
+        return idx_url[0], _scrape_detail(idx_url[1])
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(_fetch, t): t for t in tasks}
+        for future in as_completed(futures):
+            try:
+                idx, detail = future.result()
+                for field in DETAIL_FIELDS:
+                    if field in detail:
+                        df.at[idx, field] = detail[field]
+                if any(v is not None for v in detail.values()):
+                    found += 1
+            except Exception as e:
+                logger.debug(f"Detay future hatası: {e}")
+
+            with _done_lock:
+                done += 1
+                snap_done  = done
+                snap_found = found
+
+            if progress_callback:
+                progress_callback(
+                    None, total,
+                    f"Detay verisi: {snap_done}/{total} ilan ({snap_found} bulundu)"
+                )
+
+    logger.info(f"Detay tamamlandı: {found}/{total} ilandan veri bulundu")
+    return df
+
+
+# ═══════════════════════════════════════════════════════
+#  ANA SCRAPE FONKSİYONLARI
 # ═══════════════════════════════════════════════════════
 
 def scrape_listings(
@@ -403,40 +644,30 @@ def scrape_listings(
     progress_callback: Callable = None,
     debug: bool = False,
 ) -> pd.DataFrame:
-    """
-    arabam.com'dan marka+model için ilanları çek.
+    """Tek marka+model için ilanları çek (geriye dönük uyumlu)."""
+    logger.info(f"Scraping: {marka}/{model_query} | detay={fetch_details}")
 
-    Parametreler:
-        marka            : URL formatı. Örn: "alfa-romeo"
-        model_query      : URL formatı. Örn: "tonale"
-        save             : True ise data/raw_listings.csv kaydeder
-        max_pages        : Sayfa limiti (None = config default)
-        fetch_details    : True ise detay sayfasından hata/boya/değişen çeker
-        progress_callback: (page, total, status_msg) callable
-        debug            : True ise ilk başarılı sayfanın HTML'ini debug_page.html'e yazar
-    """
-    logger.info(f"Scraping: {marka} / {model_query} | detay={fetch_details} | debug={debug}")
+    cfg       = SCRAPE_CONFIG
+    limit     = max_pages or cfg["max_pages"]
+    all_rows  = []
+    consec    = 0
+    dumped    = False
+    ts        = datetime.now(timezone.utc).isoformat()
 
-    cfg   = SCRAPE_CONFIG
-    limit = max_pages or cfg["max_pages"]
-    all_listings: list = []
-    consecutive_empty = 0
-    _debug_dumped = False  # HTML'i yalnızca ilk kez yaz
-
-    # ── Listing sayfaları ────────────────────────────────
     for page in range(1, limit + 1):
-        url = build_search_url(marka, model_query, page)
-        referer = build_search_url(marka, model_query, page - 1) if page > 1 else "https://www.arabam.com/ikinci-el/otomobil"
+        url     = build_search_url(marka, model_query, page)
+        referer = (build_search_url(marka, model_query, page - 1)
+                   if page > 1 else "https://www.arabam.com/ikinci-el/otomobil")
 
         if progress_callback:
-            progress_callback(page, len(all_listings), f"Sayfa {page}/{limit} taranıyor…")
+            progress_callback(page, len(all_rows), f"Sayfa {page}/{limit} taranıyor…")
 
-        resp = _get(url, referer=referer, debug=debug and not _debug_dumped)
-        if resp is not None and debug and not _debug_dumped:
-            _debug_dumped = True
+        resp = _get(url, referer=referer, debug=debug and not dumped)
+        if resp is not None and debug and not dumped:
+            dumped = True
         if resp is None:
-            consecutive_empty += 1
-            if consecutive_empty >= 2:
+            consec += 1
+            if consec >= 2:
                 break
             continue
 
@@ -444,87 +675,155 @@ def scrape_listings(
         rows = soup.find_all("tr", class_="listing-list-item")
 
         if not rows:
-            consecutive_empty += 1
-            if consecutive_empty >= 2:
+            consec += 1
+            if consec >= 2:
                 break
             continue
 
-        consecutive_empty = 0
+        consec = 0
         for row in rows:
             listing = _parse_row(row, marka, model_query, debug=debug)
             if listing:
-                all_listings.append(listing)
+                listing["scrape_timestamp"] = ts
+                all_rows.append(listing)
 
-        logger.info(f"Sayfa {page}: {len(rows)} satır → toplam {len(all_listings)} ilan")
+        logger.info(f"Sayfa {page}: {len(rows)} satır → toplam {len(all_rows)} ilan")
 
-    if not all_listings:
+    if not all_rows:
         logger.error("Hiç ilan çekilemedi!")
         return pd.DataFrame()
 
-    df = pd.DataFrame(all_listings)
+    df = pd.DataFrame(all_rows)
 
-    # ── Detay sayfaları — paralel ThreadPoolExecutor ────
     if fetch_details:
-        total   = len(df)
-        found   = 0
-        done    = 0
-        MAX_WORKERS = SCRAPE_CONFIG.get("detail_workers", 2)
+        df = _fill_detail_pages(df, progress_callback)
 
-        logger.info(f"Detay sayfaları paralel çekiliyor ({total} ilan, {MAX_WORKERS} thread)…")
-
-        # (idx, url) çiftlerini hazırla
-        tasks = [
-            (idx, row["detail_url"])
-            for idx, row in df.iterrows()
-            if row.get("detail_url")
-        ]
-
-        # Thread-safe sayaç
-        _done_lock = threading.Lock()
-
-        def _fetch_and_return(idx_url):
-            idx, url = idx_url
-            return idx, _scrape_detail(url)
-
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = {executor.submit(_fetch_and_return, t): t for t in tasks}
-            for future in as_completed(futures):
-                try:
-                    idx, cond = future.result()
-                    df.at[idx, "errors"]        = cond["errors"]
-                    df.at[idx, "repaints"]      = cond["repaints"]
-                    df.at[idx, "changed_parts"] = cond["changed_parts"]
-                    df.at[idx, "heavy_damage"]  = cond["heavy_damage"]
-                    if any(v is not None for v in cond.values()):
-                        found += 1
-                except Exception as e:
-                    logger.debug(f"Detay future hatası: {e}")
-
-                with _done_lock:
-                    done += 1
-                    _done_snap = done
-                    _found_snap = found
-
-                if progress_callback:
-                    progress_callback(
-                        None, total,
-                        f"Detay verisi: {_done_snap}/{total} ilan "
-                        f"({_found_snap} kondisyon bulundu)"
-                    )
-
-        logger.info(f"Detay verisi tamamlandı: {found}/{total} ilandan kondisyon bulundu")
-
-    # ── Temizle & kaydet ────────────────────────────────
     df = df.drop("detail_url", axis=1, errors="ignore")
     df = df.drop_duplicates(subset=["title", "price", "km"], keep="first")
 
     if save:
-        import os
-        os.makedirs("data", exist_ok=True)
-        df.to_csv(RAW_DATA_PATH, index=False, encoding="utf-8-sig")
-        logger.info(f"Kaydedildi: {RAW_DATA_PATH} ({len(df)} ilan)")
+        try:
+            RAW_DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
+            df.to_csv(RAW_DATA_PATH, index=False, encoding="utf-8-sig")
+            logger.info(f"Kaydedildi: {RAW_DATA_PATH} ({len(df)} ilan)")
+        except OSError as e:
+            logger.warning(f"CSV kaydetme hatası: {e}")
 
     return df
+
+
+def scrape_category(
+    category_url: str,
+    max_pages: int = 30,
+    fetch_details: bool = True,
+    progress_callback: Callable = None,
+    save: bool = True,
+    debug: bool = False,
+) -> pd.DataFrame:
+    """Genel kategori sayfasını scrape et (/ikinci-el/otomobil vb.)."""
+    logger.info(f"Kategori scraping: {category_url} | sayfa_limit={max_pages}")
+
+    cfg          = SCRAPE_CONFIG
+    all_rows     = []
+    consec       = 0
+    dumped       = False
+    ts           = datetime.now(timezone.utc).isoformat()
+    cat_slug     = category_url.strip("/").split("/")[-1]
+
+    for page in range(1, max_pages + 1):
+        url     = build_category_url(category_url, page)
+        referer = (build_category_url(category_url, page - 1)
+                   if page > 1 else "https://www.arabam.com/")
+
+        if progress_callback:
+            progress_callback(page, len(all_rows), f"[{cat_slug}] Sayfa {page}/{max_pages}…")
+
+        resp = _get(url, referer=referer, debug=debug and not dumped)
+        if resp is not None and debug and not dumped:
+            dumped = True
+        if resp is None:
+            consec += 1
+            if consec >= 2:
+                break
+            continue
+
+        soup = BeautifulSoup(resp.content, "html.parser")
+        rows = soup.find_all("tr", class_="listing-list-item")
+
+        if not rows:
+            consec += 1
+            if consec >= 2:
+                break
+            continue
+
+        consec = 0
+        for row in rows:
+            listing = _parse_category_row(row, cat_slug, debug=debug)
+            if listing:
+                listing["scrape_timestamp"] = ts
+                all_rows.append(listing)
+
+        logger.info(f"[{cat_slug}] Sayfa {page}: {len(rows)} satır → toplam {len(all_rows)}")
+
+    if not all_rows:
+        logger.error(f"[{cat_slug}] Hiç ilan çekilemedi!")
+        return pd.DataFrame()
+
+    df = pd.DataFrame(all_rows)
+
+    if fetch_details:
+        df = _fill_detail_pages(df, progress_callback)
+
+    df = df.drop("detail_url", axis=1, errors="ignore")
+    df = df.drop_duplicates(subset=["title", "price", "km"], keep="first")
+
+    if save:
+        try:
+            RAW_DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
+            if RAW_DATA_PATH.exists():
+                existing = pd.read_csv(RAW_DATA_PATH, encoding="utf-8-sig")
+                df = pd.concat([existing, df], ignore_index=True)
+                df = df.drop_duplicates(subset=["title", "price", "km"], keep="first")
+            df.to_csv(RAW_DATA_PATH, index=False, encoding="utf-8-sig")
+            logger.info(f"Kaydedildi: {RAW_DATA_PATH} ({len(df)} toplam ilan)")
+        except OSError as e:
+            logger.warning(f"CSV kaydetme hatası: {e}")
+
+    return df
+
+
+def scrape_all_categories(
+    max_pages_per_category: int = 30,
+    fetch_details: bool = True,
+    progress_callback: Callable = None,
+) -> pd.DataFrame:
+    """Tüm kategori URL'lerini (otomobil + suv) scrape et ve birleştir."""
+    all_dfs = []
+    for cat_url in CATEGORY_URLS:
+        df = scrape_category(
+            category_url=cat_url,
+            max_pages=max_pages_per_category,
+            fetch_details=fetch_details,
+            progress_callback=progress_callback,
+            save=False,
+        )
+        if not df.empty:
+            all_dfs.append(df)
+
+    if not all_dfs:
+        return pd.DataFrame()
+
+    combined = pd.concat(all_dfs, ignore_index=True)
+    combined = combined.drop_duplicates(subset=["title", "price", "km"], keep="first")
+
+    try:
+        RAW_DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
+        combined.to_csv(RAW_DATA_PATH, index=False, encoding="utf-8-sig")
+        logger.info(f"Tüm kategoriler kaydedildi: {RAW_DATA_PATH} ({len(combined)} ilan)")
+    except OSError as e:
+        logger.warning(f"CSV kaydetme hatası: {e}")
+
+    return combined
 
 
 # ── Test ────────────────────────────────────────────────
@@ -533,4 +832,6 @@ if __name__ == "__main__":
     marka = sys.argv[1] if len(sys.argv) > 1 else "alfa-romeo"
     model = sys.argv[2] if len(sys.argv) > 2 else "tonale"
     df = scrape_listings(marka, model, fetch_details=True, max_pages=3)
-    print(df[["title", "price", "km", "year", "paket", "errors", "repaints", "changed_parts"]].to_string())
+    cols = [c for c in ["title", "price", "km", "year", "fuel_type",
+                         "transmission", "total_damage_score"] if c in df.columns]
+    print(df[cols].to_string())

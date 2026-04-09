@@ -1,17 +1,28 @@
 # config.py — Sabitler, URL şablonları, scraping ayarları
 
-import os
 import random as _random
+from pathlib import Path
+
+# ===== PROJE KÖKÜ =====
+BASE_DIR = Path(__file__).parent
 
 # ===== URL YAPILANDIRMASI =====
 BASE_URL = "https://www.arabam.com"
 
+# Genel kategori sayfaları (scrape_category() için)
+CATEGORY_URLS = [
+    "/ikinci-el/otomobil",
+    "/ikinci-el/suv-arazi-arac",
+]
+
+
 def build_search_url(marka: str, model: str, page: int = 1) -> str:
-    """
-    arabam.com arama URL'si oluştur.
-    Örnek: alfa-romeo / tonale → https://www.arabam.com/ikinci-el/otomobil/alfa-romeo-tonale?page=1
-    """
     return f"{BASE_URL}/ikinci-el/otomobil/{marka}-{model}?page={page}"
+
+
+def build_category_url(category_path: str, page: int = 1) -> str:
+    return f"{BASE_URL}{category_path}?page={page}"
+
 
 # ===== VERİ SINIRLAR =====
 DATA_BOUNDS = {
@@ -30,13 +41,13 @@ TARGET_COLUMN = "price"
 SCRAPE_CONFIG = {
     "delay_min": 1.5,
     "delay_max": 3.0,
-    "delay_sigma": 0.4,     # gaussian jitter
+    "delay_sigma": 0.4,
     "timeout": 15,
     "max_retries": 4,
     "max_pages": 20,
     "min_listings": 10,
-    "detail_workers": 2,    # ThreadPoolExecutor worker sayısı (detay sayfaları)
-    "backoff_base": 8,      # üstel geri çekilme taban süresi (saniye)
+    "detail_workers": 2,
+    "backoff_base": 8,
 }
 
 # ===== USER-AGENT HAVUZU =====
@@ -57,10 +68,6 @@ UA_POOL = [
 
 
 def get_random_headers(referer: str = None) -> dict:
-    """
-    UA havuzundan rastgele bir tarayıcı seç, uyumlu başlıklar döndür.
-    referer verilirse Referer başlığına eklenir.
-    """
     ua = _random.choice(UA_POOL)
     is_firefox = "Firefox" in ua
     is_edge = "Edg/" in ua
@@ -111,7 +118,7 @@ def get_random_headers(referer: str = None) -> dict:
     return headers
 
 
-# ===== HTTP HEADERS (geriye dönük uyumluluk için) =====
+# ===== HTTP HEADERS (geriye dönük uyumluluk) =====
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -137,7 +144,6 @@ HEADERS = {
 }
 
 # ===== TRAMER ANAHTAR KELİMELER =====
-# İlan açıklamasında bu ifadeler aranır (case-insensitive)
 TRAMER_NEGATIVE_KEYWORDS = [
     "tramer yok", "trameri yok", "0 tramer", "tramer kaydı yok",
     "hasar kaydı yok", "hasarsız", "hasar yok",
@@ -148,63 +154,60 @@ TRAMER_POSITIVE_KEYWORDS = [
 ]
 
 # ===== DOSYA YOLLARI =====
-BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR   = os.path.join(BASE_DIR, "data")
-MODEL_DIR  = os.path.join(BASE_DIR, "models")
-PLOTS_DIR  = os.path.join(BASE_DIR, "plots")
-LOGS_DIR   = os.path.join(BASE_DIR, "logs")
+DATA_DIR   = BASE_DIR / "data"
+MODEL_DIR  = BASE_DIR / "models"
+PLOTS_DIR  = BASE_DIR / "plots"
+LOGS_DIR   = BASE_DIR / "logs"
 
-RAW_DATA_PATH       = os.path.join(DATA_DIR, "raw_listings.csv")
-CLEANED_DATA_PATH   = os.path.join(DATA_DIR, "cleaned_data.csv")
-PROCESSED_DATA_PATH = os.path.join(DATA_DIR, "processed_data.csv")
+RAW_DATA_PATH        = DATA_DIR / "raw_listings.csv"
+CLEANED_DATA_PATH    = DATA_DIR / "cleaned_data.csv"
+PROCESSED_DATA_PATH  = DATA_DIR / "processed_data.csv"
 
-MODEL_PATH       = os.path.join(MODEL_DIR, "model.pkl")
-ENGINEER_PATH    = os.path.join(MODEL_DIR, "feature_engineer.pkl")
-FEATURE_INFO_PATH = os.path.join(MODEL_DIR, "feature_info.json")
+MODEL_PATH            = MODEL_DIR / "model.pkl"
+ENGINEER_PATH         = MODEL_DIR / "feature_engineer.pkl"
+FEATURE_INFO_PATH     = MODEL_DIR / "feature_info.json"
+FEATURE_COLUMNS_PATH  = MODEL_DIR / "feature_columns.pkl"
 
-LOG_PATH = os.path.join(LOGS_DIR, "scrape_log.txt")
+RF_MODEL_PATH         = MODEL_DIR / "rf_model.pkl"
+GB_MODEL_PATH         = MODEL_DIR / "gb_model.pkl"
+XGB_MODEL_PATH        = MODEL_DIR / "xgb_model.pkl"
+ENSEMBLE_WEIGHTS_PATH = MODEL_DIR / "ensemble_weights.pkl"
+FEATURE_IMP_PATH      = MODEL_DIR / "feature_importances.csv"
 
-# ===== MODEL HİPERPARAMETRELERİ =====
-# Dataset büyüklüğüne göre otomatik seçilir (model_trainer.py kullanır)
-LGBM_PARAMS_SMALL = {   # < 200 sample
-    "n_estimators": 80,
-    "learning_rate": 0.1,
-    "max_depth": 4,
-    "num_leaves": 15,
-    "min_data_in_leaf": 5,
-    "subsample": 0.8,
-    "colsample_bytree": 0.8,
-    "verbose": -1,
-    "random_state": 42,
+LOG_PATH = LOGS_DIR / "scrape_log.txt"
+
+# ===== LEGACY MODEL PARAMETRELERİ =====
+LGBM_PARAMS_SMALL = {
+    "n_estimators": 80, "learning_rate": 0.1, "max_depth": 4,
+    "num_leaves": 15, "min_data_in_leaf": 5, "subsample": 0.8,
+    "colsample_bytree": 0.8, "verbose": -1, "random_state": 42,
 }
-LGBM_PARAMS_MEDIUM = {  # 200–1000 sample
-    "n_estimators": 150,
-    "learning_rate": 0.05,
-    "max_depth": 6,
-    "num_leaves": 31,
-    "min_data_in_leaf": 15,
-    "subsample": 0.8,
-    "colsample_bytree": 0.8,
-    "verbose": -1,
-    "random_state": 42,
+LGBM_PARAMS_MEDIUM = {
+    "n_estimators": 150, "learning_rate": 0.05, "max_depth": 6,
+    "num_leaves": 31, "min_data_in_leaf": 15, "subsample": 0.8,
+    "colsample_bytree": 0.8, "verbose": -1, "random_state": 42,
 }
-LGBM_PARAMS_LARGE = {   # > 1000 sample
-    "n_estimators": 250,
-    "learning_rate": 0.03,
-    "max_depth": 8,
-    "num_leaves": 63,
-    "min_data_in_leaf": 20,
-    "subsample": 0.8,
-    "colsample_bytree": 0.8,
-    "verbose": -1,
-    "random_state": 42,
+LGBM_PARAMS_LARGE = {
+    "n_estimators": 250, "learning_rate": 0.03, "max_depth": 8,
+    "num_leaves": 63, "min_data_in_leaf": 20, "subsample": 0.8,
+    "colsample_bytree": 0.8, "verbose": -1, "random_state": 42,
 }
-
 RF_PARAMS = {
-    "n_estimators": 100,
-    "max_depth": 10,
-    "min_samples_split": 5,
-    "min_samples_leaf": 3,
+    "n_estimators": 100, "max_depth": 10, "min_samples_split": 5,
+    "min_samples_leaf": 3, "random_state": 42, "n_jobs": -1,
+}
+
+# ===== YENİ ENSEMBLE PARAMETRELERİ =====
+RF_PARAMS_NEW = {
+    "n_estimators": 300, "max_depth": 6, "min_samples_leaf": 8,
+    "random_state": 42, "n_jobs": -1,
+}
+GB_PARAMS = {
+    "n_estimators": 300, "max_depth": 4, "min_samples_leaf": 8,
     "random_state": 42,
-    "n_jobs": -1,
+}
+XGB_PARAMS = {
+    "n_estimators": 300, "max_depth": 5, "min_child_weight": 8,
+    "learning_rate": 0.05, "random_state": 42,
+    "eval_metric": "rmse", "verbosity": 0,
 }
