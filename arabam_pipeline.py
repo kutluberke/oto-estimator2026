@@ -15,7 +15,7 @@ import warnings
 import joblib
 import numpy as np
 import pandas as pd
-import requests
+from curl_cffi import requests
 from bs4 import BeautifulSoup
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
@@ -78,6 +78,7 @@ def _fetch_html(session: requests.Session, url: str, max_retries: int = 3) -> st
             resp = session.get(
                 url,
                 headers=_make_headers(referer="https://www.arabam.com/"),
+                impersonate="chrome",
                 timeout=15,
             )
             if resp.status_code == 200:
@@ -194,7 +195,7 @@ def scrape() -> pd.DataFrame:
     page     = 1
 
     # Warmup: ana sayfa
-    session.get("https://www.arabam.com/", headers=_make_headers(), timeout=10)
+    session.get("https://www.arabam.com/", headers=_make_headers(), impersonate="chrome", timeout=10)
     time.sleep(random.uniform(1.0, 2.0))
 
     while len(all_rows) < _TARGET:

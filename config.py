@@ -39,14 +39,14 @@ TARGET_COLUMN = "price"
 
 # ===== SCRAPING AYARLARI =====
 SCRAPE_CONFIG = {
-    "delay_min": 1.5,
-    "delay_max": 3.0,
-    "delay_sigma": 0.4,
+    "delay_min": 0.6,
+    "delay_max": 1.2,
+    "delay_sigma": 0.2,
     "timeout": 15,
     "max_retries": 4,
     "max_pages": 20,
     "min_listings": 10,
-    "detail_workers": 2,
+    "detail_workers": 6,
     "backoff_base": 8,
 }
 

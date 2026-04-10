@@ -1,11 +1,12 @@
 # arabam.com Fiyat Tahmin Modeli — Bağımlılıklar
-# Kurulum: pip install -r requirements.txt
+# Kurulum:
+#   pip install -r requirements.txt
 
 streamlit>=1.35.0
-requests>=2.31.0
+nodriver>=0.40
+curl_cffi>=0.7
 beautifulsoup4>=4.12.0
 lxml>=4.9.0
-cloudscraper>=1.2.71
 pandas>=2.0.0
 numpy>=1.24.0
 scipy>=1.11.0
