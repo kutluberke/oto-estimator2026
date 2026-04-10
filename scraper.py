@@ -1,4 +1,4 @@
-# scraper.py — arabam.com ikinci el ilan scraper (nodriver tabanlı)
+# scraper.py — arabam.com ikinci el ilan scraper (requests + BeautifulSoup)
 #
 # HTML yapısı (2026-04 itibarıyla doğrulandı):
 #   <tr class='listing-list-item'>
@@ -11,20 +11,19 @@
 #     td[6] → Fiyat  (listing-price span, "1.299.000 TL")
 #     td[7] → Tarih
 #     td[8] → Konum + butonlar
-#
-# Kurulum:
-#   pip install nodriver
 
 import re
+import time
 import random
-import asyncio
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-import pandas as pd
-from bs4 import BeautifulSoup
 from typing import Optional, Callable
 
-import nodriver as uc
+import requests
+import pandas as pd
+from bs4 import BeautifulSoup
 
 from config import (
     SCRAPE_CONFIG, DATA_BOUNDS,
@@ -39,66 +38,108 @@ if not logger.handlers:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Browser yardımcıları (nodriver)
+#  HTTP katmanı
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def _get_browser() -> uc.Browser:
-    browser = await uc.start(
-        headless=False,
-        browser_args=[
-            "--no-sandbox",
-            "--disable-blink-features=AutomationControlled",
-            "--disable-dev-shm-usage",
-        ],
-    )
-    return browser
+_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) "
+    "Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+]
+
+# Detay istekeleri için thread-local session (her thread kendi session'ını kullanır)
+_thread_local = threading.local()
+
+# Rate-limiting için global kilit (detay sayfaları paralel ama kibar olsun)
+_rate_lock = threading.Lock()
 
 
-async def _fetch_page(browser: uc.Browser, url: str, wait_selector: str = None) -> str:
-    """URL'yi mevcut sekmede aç, isteğe bağlı selector bekle, HTML döndür."""
-    tab = await browser.get(url)
-    await asyncio.sleep(random.uniform(2.0, 4.0))
-    if wait_selector:
+def _make_headers(referer: str = None) -> dict:
+    ua = random.choice(_USER_AGENTS)
+    headers = {
+        "User-Agent":              ua,
+        "Accept":                  "text/html,application/xhtml+xml,application/xml;"
+                                   "q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language":         "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Encoding":         "gzip, deflate, br",
+        "Connection":              "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "DNT":                     "1",
+        "Referer":                 referer or "https://www.arabam.com/",
+    }
+    if "Firefox" not in ua:
+        headers.update({
+            "sec-ch-ua":          '"Chromium";v="124","Google Chrome";v="124","Not-A.Brand";v="99"',
+            "sec-ch-ua-mobile":   "?0",
+            "sec-ch-ua-platform": '"Windows"',
+            "sec-fetch-dest":     "document",
+            "sec-fetch-mode":     "navigate",
+            "sec-fetch-site":     "same-origin",
+            "sec-fetch-user":     "?1",
+        })
+    return headers
+
+
+def _make_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update(_make_headers())
+    return s
+
+
+def _fetch_html(
+    session: requests.Session,
+    url: str,
+    max_retries: int = None,
+) -> Optional[str]:
+    """GET isteği at; 403/429/503'te üstel geri çekilme ile yeniden dene."""
+    cfg     = SCRAPE_CONFIG
+    retries = max_retries if max_retries is not None else cfg.get("max_retries", 3)
+
+    for attempt in range(retries):
         try:
-            await tab.find(wait_selector, timeout=10)
-        except Exception:
-            pass
-    try:
-        content = await tab.get_content()
-    except Exception as e:
-        logger.warning("get_content hatası (%s): %s", url, e)
-        content = ""
-    return content
+            resp = session.get(
+                url,
+                headers=_make_headers(referer="https://www.arabam.com/"),
+                timeout=cfg.get("timeout", 15),
+            )
+            if resp.status_code == 200:
+                return resp.text
+            if resp.status_code in (403, 429, 503):
+                wait = cfg.get("backoff_base", 8) * (2 ** attempt) + random.uniform(0, 2)
+                logger.warning("HTTP %d — %.1fs bekleniyor (deneme %d/%d): %s",
+                               resp.status_code, wait, attempt + 1, retries, url)
+                time.sleep(wait)
+                continue
+            logger.warning("HTTP %d: %s", resp.status_code, url)
+            return None
+        except requests.RequestException as exc:
+            wait = 4 * (2 ** attempt)
+            logger.warning("İstek hatası (deneme %d/%d): %s — %.1fs bekleniyor",
+                           attempt + 1, retries, exc, wait)
+            time.sleep(wait)
+
+    logger.error("Tüm denemeler başarısız: %s", url)
+    return None
 
 
-async def _fetch_detail_tab(browser: uc.Browser, url: str) -> str:
-    """Detay sayfasını YENİ sekmede aç, HTML döndür, sekmeyi kapat."""
-    tab = None
-    try:
-        tab = await browser.get(url, new_tab=True)
-        await asyncio.sleep(random.uniform(2.0, 3.5))
-        try:
-            await tab.find(".technical-properties", timeout=8)
-        except Exception:
-            try:
-                await tab.find(".classified-detail", timeout=5)
-            except Exception:
-                pass
-        try:
-            content = await tab.get_content()
-        except Exception as e:
-            logger.debug("Detay get_content hatası (%s): %s", url, e)
-            content = ""
-        return content
-    except Exception as e:
-        logger.debug("Detay sekme hatası (%s): %s", url, e)
-        return ""
-    finally:
-        if tab is not None:
-            try:
-                await tab.close()
-            except Exception:
-                pass
+def _fetch_detail_html(url: str) -> str:
+    """Thread-local session ile detay sayfasını çek."""
+    if not hasattr(_thread_local, "session"):
+        _thread_local.session = _make_session()
+
+    with _rate_lock:
+        time.sleep(random.uniform(
+            SCRAPE_CONFIG.get("delay_min", 1.5),
+            SCRAPE_CONFIG.get("delay_max", 3.0),
+        ))
+
+    html = _fetch_html(_thread_local.session, url, max_retries=2)
+    return html or ""
 
 
 def _dump_debug_html(url: str, html: str, path: str = "debug_page.html") -> None:
@@ -470,7 +511,6 @@ def _parse_category_row(row, category_slug: str, debug: bool = False) -> Optiona
         title      = (title_div.get_text(strip=True) if title_div
                       else tds[2].get_text(strip=True) or model_full)
 
-        # brand/model'i ilan URL'sinden çıkar
         detail_a = row.find("a", href=re.compile(r"/ilan/"))
         brand = model = ""
         if detail_a:
@@ -516,7 +556,7 @@ def _parse_category_row(row, category_slug: str, debug: bool = False) -> Optiona
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Detay sayfalarını paralel çek (asyncio.gather + Semaphore, max 3 tab)
+#  Detay sayfalarını paralel çek (ThreadPoolExecutor)
 # ─────────────────────────────────────────────────────────────────────────────
 
 DETAIL_FIELDS = [
@@ -529,65 +569,58 @@ DETAIL_FIELDS = [
 ]
 
 
-async def _fill_detail_pages_async(
-    browser: uc.Browser,
+def _fill_detail_pages(
     df: pd.DataFrame,
     progress_callback: Optional[Callable] = None,
 ) -> pd.DataFrame:
-    total      = len(df)
-    semaphore  = asyncio.Semaphore(3)  # max 3 eşzamanlı sekme
-    done_count = 0
-    found_count = 0
-    count_lock = asyncio.Lock()
+    workers  = SCRAPE_CONFIG.get("detail_workers", 3)
+    tasks    = [(idx, row["detail_url"])
+                for idx, row in df.iterrows() if row.get("detail_url")]
+    total    = len(df)
+    done     = 0
+    found    = 0
+    lock     = threading.Lock()
 
-    tasks = [
-        (idx, row["detail_url"])
-        for idx, row in df.iterrows()
-        if row.get("detail_url")
-    ]
-    logger.info(
-        "Detay sayfaları çekiliyor (%d ilan, max 3 eşzamanlı)…", len(tasks)
-    )
+    logger.info("Detay sayfaları çekiliyor (%d ilan, %d worker)…", len(tasks), workers)
 
-    async def fetch_one(idx: int, url: str):
-        nonlocal done_count, found_count
-        async with semaphore:
-            html   = await _fetch_detail_tab(browser, url)
-            detail = _parse_detail_html(html)
-
-        async with count_lock:
-            done_count += 1
-            if any(v is not None for v in detail.values()):
-                found_count += 1
-            snap_done  = done_count
-            snap_found = found_count
-
-        logger.debug("Detay: %d/%d (%d bulundu)", snap_done, total, snap_found)
+    def fetch_one(idx_url):
+        idx, url = idx_url
+        html   = _fetch_detail_html(url)
+        detail = _parse_detail_html(html)
         return idx, detail
 
-    results = await asyncio.gather(
-        *[fetch_one(idx, url) for idx, url in tasks],
-        return_exceptions=True,
-    )
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(fetch_one, t): t for t in tasks}
+        for future in as_completed(futures):
+            try:
+                idx, detail = future.result()
+                with lock:
+                    done += 1
+                    if any(v is not None for v in detail.values()):
+                        found += 1
+                    snap_done, snap_found = done, found
 
-    for result in results:
-        if isinstance(result, Exception):
-            logger.debug("Detay future hatası: %s", result)
-            continue
-        idx, detail = result
-        for field in DETAIL_FIELDS:
-            if field in detail:
-                df.at[idx, field] = detail[field]
+                for field in DETAIL_FIELDS:
+                    if field in detail:
+                        df.at[idx, field] = detail[field]
 
-    logger.info("Detay tamamlandı: %d/%d ilandan veri bulundu", found_count, total)
+                if progress_callback:
+                    progress_callback(
+                        snap_done, total,
+                        f"Detay: {snap_done}/{total} ilan ({snap_found} bulundu)",
+                    )
+            except Exception as exc:
+                logger.debug("Detay future hatası: %s", exc)
+
+    logger.info("Detay tamamlandı: %d/%d ilandan veri bulundu", found, total)
     return df
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Async çekirdek fonksiyonlar
+#  Çekirdek scraping fonksiyonları
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def _async_scrape_listings(
+def _scrape_listings_core(
     marka: str,
     model_query: str,
     max_pages: int,
@@ -596,157 +629,155 @@ async def _async_scrape_listings(
     debug: bool,
 ) -> pd.DataFrame:
     cfg      = SCRAPE_CONFIG
-    limit    = max_pages or cfg["max_pages"]
     all_rows = []
     consec   = 0
     dumped   = False
     ts       = datetime.now(timezone.utc).isoformat()
+    session  = _make_session()
 
-    browser = await _get_browser()
-
+    # Warmup: ana sayfayı ziyaret et
     try:
-        # Warmup: ana sayfayı ziyaret et
-        logger.info("Warmup: arabam.com ana sayfası açılıyor…")
-        try:
-            await browser.get("https://www.arabam.com/")
-            await asyncio.sleep(random.uniform(3.0, 5.0))
-        except Exception as e:
-            logger.warning("Warmup hatası: %s", e)
+        session.get("https://www.arabam.com/",
+                    headers=_make_headers(), timeout=10)
+        time.sleep(random.uniform(1.0, 2.0))
+    except Exception:
+        pass
 
-        for page_num in range(1, limit + 1):
-            url = build_search_url(marka, model_query, page_num)
-            logger.info("Sayfa %d/%d: %s", page_num, limit, url)
+    for page_num in range(1, max_pages + 1):
+        url = build_search_url(marka, model_query, page_num)
 
-            html = await _fetch_page(browser, url, wait_selector="tr.listing-list-item")
+        if progress_callback:
+            progress_callback(page_num, max_pages,
+                              f"Sayfa {page_num}/{max_pages} taranıyor...")
 
-            if not html:
-                consec += 1
-                if consec >= 2:
-                    break
-                continue
+        logger.info("Sayfa %d/%d: %s", page_num, max_pages, url)
+        html = _fetch_html(session, url)
 
-            if debug and not dumped:
-                _dump_debug_html(url, html)
-                dumped = True
+        if html is None:
+            consec += 1
+            if consec >= 2:
+                break
+            continue
 
-            soup = BeautifulSoup(html, "html.parser")
-            rows = soup.find_all("tr", class_="listing-list-item")
+        if debug and not dumped:
+            _dump_debug_html(url, html)
+            dumped = True
 
-            if not rows:
-                consec += 1
-                logger.warning("Sayfa %d: ilan satırı bulunamadı (consec=%d)", page_num, consec)
-                if consec >= 2:
-                    break
-                continue
+        soup = BeautifulSoup(html, "html.parser")
+        rows = soup.find_all("tr", class_="listing-list-item")
 
-            consec = 0
-            for row in rows:
-                listing = _parse_row(row, marka, model_query, debug=debug)
-                if listing:
-                    listing["scrape_timestamp"] = ts
-                    all_rows.append(listing)
+        if not rows:
+            consec += 1
+            logger.warning("Sayfa %d: ilan satırı bulunamadı (consec=%d)", page_num, consec)
+            if consec >= 2:
+                break
+            continue
 
-            logger.info("Sayfa %d: %d satır → toplam %d ilan",
-                        page_num, len(rows), len(all_rows))
+        consec = 0
+        for row in rows:
+            listing = _parse_row(row, marka, model_query, debug=debug)
+            if listing:
+                listing["scrape_timestamp"] = ts
+                all_rows.append(listing)
 
-            await asyncio.sleep(random.uniform(1.5, 3.0))
+        logger.info("Sayfa %d: %d satır -> toplam %d ilan",
+                    page_num, len(rows), len(all_rows))
 
-        if not all_rows:
-            return pd.DataFrame()
+        time.sleep(random.uniform(
+            cfg.get("delay_min", 1.5),
+            cfg.get("delay_max", 3.0),
+        ))
 
-        df = pd.DataFrame(all_rows)
+    if not all_rows:
+        return pd.DataFrame()
 
-        if fetch_details:
-            df = await _fill_detail_pages_async(browser, df, progress_callback)
+    df = pd.DataFrame(all_rows)
 
-    finally:
-        try:
-            browser.stop()
-        except Exception:
-            pass
+    if fetch_details:
+        df = _fill_detail_pages(df, progress_callback)
 
     return df
 
 
-async def _async_scrape_category(
+def _scrape_category_core(
     category_url: str,
     max_pages: int,
     fetch_details: bool,
     progress_callback: Optional[Callable],
     debug: bool,
 ) -> pd.DataFrame:
+    cfg      = SCRAPE_CONFIG
     all_rows = []
     consec   = 0
     dumped   = False
     ts       = datetime.now(timezone.utc).isoformat()
     cat_slug = category_url.strip("/").split("/")[-1]
-
-    browser = await _get_browser()
+    session  = _make_session()
 
     try:
-        logger.info("Warmup: arabam.com ana sayfası açılıyor…")
-        try:
-            await browser.get("https://www.arabam.com/")
-            await asyncio.sleep(random.uniform(3.0, 5.0))
-        except Exception as e:
-            logger.warning("Warmup hatası: %s", e)
+        session.get("https://www.arabam.com/",
+                    headers=_make_headers(), timeout=10)
+        time.sleep(random.uniform(1.0, 2.0))
+    except Exception:
+        pass
 
-        for page_num in range(1, max_pages + 1):
-            url = build_category_url(category_url, page_num)
-            logger.info("[%s] Sayfa %d/%d", cat_slug, page_num, max_pages)
+    for page_num in range(1, max_pages + 1):
+        url = build_category_url(category_url, page_num)
 
-            html = await _fetch_page(browser, url, wait_selector="tr.listing-list-item")
+        if progress_callback:
+            progress_callback(page_num, max_pages,
+                              f"[{cat_slug}] Sayfa {page_num}/{max_pages}...")
 
-            if not html:
-                consec += 1
-                if consec >= 2:
-                    break
-                continue
+        logger.info("[%s] Sayfa %d/%d", cat_slug, page_num, max_pages)
+        html = _fetch_html(session, url)
 
-            if debug and not dumped:
-                _dump_debug_html(url, html)
-                dumped = True
+        if html is None:
+            consec += 1
+            if consec >= 2:
+                break
+            continue
 
-            soup = BeautifulSoup(html, "html.parser")
-            rows = soup.find_all("tr", class_="listing-list-item")
+        if debug and not dumped:
+            _dump_debug_html(url, html)
+            dumped = True
 
-            if not rows:
-                consec += 1
-                if consec >= 2:
-                    break
-                continue
+        soup = BeautifulSoup(html, "html.parser")
+        rows = soup.find_all("tr", class_="listing-list-item")
 
-            consec = 0
-            for row in rows:
-                listing = _parse_category_row(row, cat_slug, debug=debug)
-                if listing:
-                    listing["scrape_timestamp"] = ts
-                    all_rows.append(listing)
+        if not rows:
+            consec += 1
+            if consec >= 2:
+                break
+            continue
 
-            logger.info("[%s] Sayfa %d: %d satır → toplam %d ilan",
-                        cat_slug, page_num, len(rows), len(all_rows))
+        consec = 0
+        for row in rows:
+            listing = _parse_category_row(row, cat_slug, debug=debug)
+            if listing:
+                listing["scrape_timestamp"] = ts
+                all_rows.append(listing)
 
-            await asyncio.sleep(random.uniform(1.5, 3.0))
+        logger.info("[%s] Sayfa %d: %d satir -> toplam %d ilan",
+                    cat_slug, page_num, len(rows), len(all_rows))
 
-        if not all_rows:
-            return pd.DataFrame()
+        time.sleep(random.uniform(
+            cfg.get("delay_min", 1.5),
+            cfg.get("delay_max", 3.0),
+        ))
 
-        df = pd.DataFrame(all_rows)
+    if not all_rows:
+        return pd.DataFrame()
 
-        if fetch_details:
-            df = await _fill_detail_pages_async(browser, df, progress_callback)
+    df = pd.DataFrame(all_rows)
 
-    finally:
-        try:
-            browser.stop()
-        except Exception:
-            pass
+    if fetch_details:
+        df = _fill_detail_pages(df, progress_callback)
 
     return df
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Herkese açık API (senkron sarmalayıcılar)
+#  Herkese açık API
 # ─────────────────────────────────────────────────────────────────────────────
 
 def scrape_listings(
@@ -761,14 +792,14 @@ def scrape_listings(
     """Tek marka+model için ilanları çek."""
     logger.info("Scraping: %s/%s | detay=%s", marka, model_query, fetch_details)
 
-    df = asyncio.run(_async_scrape_listings(
+    df = _scrape_listings_core(
         marka, model_query,
         max_pages or SCRAPE_CONFIG["max_pages"],
         fetch_details, progress_callback, debug,
-    ))
+    )
 
     if df is None or df.empty:
-        logger.error("Hiç ilan çekilemedi!")
+        logger.error("Hic ilan cekilemedi!")
         return pd.DataFrame()
 
     df = df.drop("detail_url", axis=1, errors="ignore")
@@ -780,7 +811,7 @@ def scrape_listings(
             df.to_csv(RAW_DATA_PATH, index=False, encoding="utf-8-sig")
             logger.info("Kaydedildi: %s (%d ilan)", RAW_DATA_PATH, len(df))
         except OSError as e:
-            logger.warning("CSV kaydetme hatası: %s", e)
+            logger.warning("CSV kaydetme hatasi: %s", e)
 
     return df
 
@@ -793,15 +824,15 @@ def scrape_category(
     save: bool = True,
     debug: bool = False,
 ) -> pd.DataFrame:
-    """Genel kategori sayfasını scrape et (/ikinci-el/otomobil vb.)."""
+    """Genel kategori sayfasini scrape et (/ikinci-el/otomobil vb.)."""
     logger.info("Kategori scraping: %s | sayfa_limit=%d", category_url, max_pages)
 
-    df = asyncio.run(_async_scrape_category(
+    df = _scrape_category_core(
         category_url, max_pages, fetch_details, progress_callback, debug,
-    ))
+    )
 
     if df is None or df.empty:
-        logger.error("[%s] Hiç ilan çekilemedi!", category_url)
+        logger.error("[%s] Hic ilan cekilemedi!", category_url)
         return pd.DataFrame()
 
     df = df.drop("detail_url", axis=1, errors="ignore")
@@ -817,7 +848,7 @@ def scrape_category(
             df.to_csv(RAW_DATA_PATH, index=False, encoding="utf-8-sig")
             logger.info("Kaydedildi: %s (%d toplam ilan)", RAW_DATA_PATH, len(df))
         except OSError as e:
-            logger.warning("CSV kaydetme hatası: %s", e)
+            logger.warning("CSV kaydetme hatasi: %s", e)
 
     return df
 
@@ -827,7 +858,7 @@ def scrape_all_categories(
     fetch_details: bool = True,
     progress_callback: Optional[Callable] = None,
 ) -> pd.DataFrame:
-    """Tüm CATEGORY_URLS'leri (otomobil + suv) scrape et ve birleştir."""
+    """Tum CATEGORY_URLS'leri (otomobil + suv) scrape et ve birlestir."""
     all_dfs = []
     for cat_url in CATEGORY_URLS:
         df = scrape_category(
@@ -849,10 +880,10 @@ def scrape_all_categories(
     try:
         RAW_DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
         combined.to_csv(RAW_DATA_PATH, index=False, encoding="utf-8-sig")
-        logger.info("Tüm kategoriler kaydedildi: %s (%d ilan)",
+        logger.info("Tum kategoriler kaydedildi: %s (%d ilan)",
                     RAW_DATA_PATH, len(combined))
     except OSError as e:
-        logger.warning("CSV kaydetme hatası: %s", e)
+        logger.warning("CSV kaydetme hatasi: %s", e)
 
     return combined
 
@@ -864,13 +895,13 @@ def scrape_all_categories(
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="arabam.com scraper (nodriver)")
+    parser = argparse.ArgumentParser(description="arabam.com scraper (requests+BS4)")
     parser.add_argument("--mode", choices=["single", "category", "all"], default="single")
     parser.add_argument("--marka", default="volkswagen")
     parser.add_argument("--model", default="golf")
     parser.add_argument("--pages", type=int, default=30)
     parser.add_argument("--no-details", action="store_true",
-                        help="Detay sayfalarını çekme")
+                        help="Detay sayfalarini cekme")
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
